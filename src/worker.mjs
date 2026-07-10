@@ -58,6 +58,14 @@ function brazilNow() {
   };
 }
 
+function brazilToday() {
+  // Date object at UTC-midnight representing "today" in Brazil time, used
+  // purely for date-math in the calendar resolver below.
+  const now = new Date();
+  const shifted = new Date(now.getTime() - 3 * 60 * 60 * 1000);
+  return new Date(Date.UTC(shifted.getUTCFullYear(), shifted.getUTCMonth(), shifted.getUTCDate()));
+}
+
 async function handleScheduled(env) {
   const subRaw = await env.ROTINA_KV.get('subscription');
   const cfgRaw = await env.ROTINA_KV.get('config');
@@ -107,6 +115,217 @@ async function handleScheduled(env) {
   }
 }
 
+// ---------- Minimal ICS (iCalendar) parser + "today" resolver ----------
+// Not a full RFC5545 implementation - covers the common cases found in
+// personal Google Calendar exports: single events, all-day events, and
+// DAILY/WEEKLY/MONTHLY/YEARLY recurrence with INTERVAL/BYDAY/UNTIL/COUNT.
+
+function unfoldIcs(text) {
+  return text.replace(/\r\n/g, '\n').replace(/\n[ \t]/g, '');
+}
+
+function parseIcsDate(value, params) {
+  const isDateOnly = (params && params.VALUE === 'DATE') || /^\d{8}$/.test(value);
+  const y = Number(value.slice(0, 4));
+  const mo = Number(value.slice(4, 6)) - 1;
+  const d = Number(value.slice(6, 8));
+  if (isDateOnly) {
+    return { date: new Date(Date.UTC(y, mo, d)), allDay: true };
+  }
+  const h = Number(value.slice(9, 11));
+  const mi = Number(value.slice(11, 13));
+  const isUtc = value.endsWith('Z');
+  let dt;
+  if (isUtc) {
+    dt = new Date(Date.UTC(y, mo, d, h, mi) - 3 * 60 * 60 * 1000);
+  } else {
+    // Treat as already being in Brazil local time (covers TZID=America/Sao_Paulo
+    // and floating times, which is the common case for a personal calendar).
+    dt = new Date(Date.UTC(y, mo, d, h, mi));
+  }
+  return { date: dt, allDay: false, raw: dt };
+}
+
+function dateOnly(d) {
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+}
+
+function diffDays(a, b) {
+  return Math.round((dateOnly(b) - dateOnly(a)) / 86400000);
+}
+
+function parsePropLine(line) {
+  const colonIdx = line.indexOf(':');
+  if (colonIdx === -1) return null;
+  const left = line.slice(0, colonIdx);
+  const value = line.slice(colonIdx + 1);
+  const [name, ...paramParts] = left.split(';');
+  const params = {};
+  for (const p of paramParts) {
+    const [k, v] = p.split('=');
+    if (k) params[k] = v;
+  }
+  return { name, params, value };
+}
+
+function parseRRuleString(value) {
+  const rule = {};
+  for (const part of value.split(';')) {
+    const [k, v] = part.split('=');
+    if (k) rule[k] = v;
+  }
+  return rule;
+}
+
+const ICS_DAY_TO_JS = { SU: 0, MO: 1, TU: 2, WE: 3, TH: 4, FR: 5, SA: 6 };
+
+function parseIcs(text) {
+  const lines = unfoldIcs(text).split('\n').map((l) => l.trim()).filter(Boolean);
+  const events = [];
+  let cur = null;
+  for (const line of lines) {
+    if (line === 'BEGIN:VEVENT') {
+      cur = { exdates: [] };
+      continue;
+    }
+    if (line === 'END:VEVENT') {
+      if (cur) events.push(cur);
+      cur = null;
+      continue;
+    }
+    if (!cur) continue;
+    const prop = parsePropLine(line);
+    if (!prop) continue;
+    if (prop.name === 'SUMMARY') cur.summary = prop.value.replace(/\\,/g, ',').replace(/\\n/gi, ' ');
+    else if (prop.name === 'DTSTART') cur.dtstart = parseIcsDate(prop.value, prop.params);
+    else if (prop.name === 'DTEND') cur.dtend = parseIcsDate(prop.value, prop.params);
+    else if (prop.name === 'RRULE') cur.rrule = parseRRuleString(prop.value);
+    else if (prop.name === 'EXDATE') {
+      for (const v of prop.value.split(',')) {
+        const parsed = parseIcsDate(v, prop.params);
+        cur.exdates.push(dateOnly(parsed.date).getTime());
+      }
+    }
+  }
+  return events;
+}
+
+function ruleMatchesDateNoCount(rrule, start, target) {
+  const rruleNoCount = { ...rrule };
+  delete rruleNoCount.COUNT;
+  return ruleMatchesDate(rruleNoCount, start, target);
+}
+
+function ruleMatchesDate(rrule, dtstartDate, targetDate) {
+  const freq = rrule.FREQ;
+  const interval = parseInt(rrule.INTERVAL || '1', 10) || 1;
+  const start = dateOnly(dtstartDate);
+  const target = dateOnly(targetDate);
+  if (target < start) return false;
+
+  if (rrule.UNTIL) {
+    const untilParsed = parseIcsDate(rrule.UNTIL, {});
+    if (target > dateOnly(untilParsed.date)) return false;
+  }
+
+  const dayDiff = diffDays(start, target);
+
+  if (freq === 'DAILY') {
+    if (dayDiff % interval !== 0) return false;
+  } else if (freq === 'WEEKLY') {
+    const startWeekMon = new Date(start);
+    const startDow = (start.getUTCDay() + 6) % 7;
+    startWeekMon.setUTCDate(startWeekMon.getUTCDate() - startDow);
+    const targetWeekMon = new Date(target);
+    const targetDow = (target.getUTCDay() + 6) % 7;
+    targetWeekMon.setUTCDate(targetWeekMon.getUTCDate() - targetDow);
+    const weekDiff = Math.round((targetWeekMon - startWeekMon) / (7 * 86400000));
+    if (weekDiff < 0 || weekDiff % interval !== 0) return false;
+    if (rrule.BYDAY) {
+      const days = rrule.BYDAY.split(',').map((d) => ICS_DAY_TO_JS[d.slice(-2)]);
+      if (!days.includes(target.getUTCDay())) return false;
+    } else if (target.getUTCDay() !== start.getUTCDay()) {
+      return false;
+    }
+  } else if (freq === 'MONTHLY') {
+    if (target.getUTCDate() !== start.getUTCDate()) return false;
+    const monthDiff = (target.getUTCFullYear() - start.getUTCFullYear()) * 12 + (target.getUTCMonth() - start.getUTCMonth());
+    if (monthDiff < 0 || monthDiff % interval !== 0) return false;
+  } else if (freq === 'YEARLY') {
+    if (target.getUTCDate() !== start.getUTCDate() || target.getUTCMonth() !== start.getUTCMonth()) return false;
+    const yearDiff = target.getUTCFullYear() - start.getUTCFullYear();
+    if (yearDiff < 0 || yearDiff % interval !== 0) return false;
+  } else {
+    return false;
+  }
+
+  if (rrule.COUNT) {
+    const count = parseInt(rrule.COUNT, 10);
+    let n = 0;
+    let cursor = new Date(start);
+    let guard = 0;
+    while (cursor <= target && guard < 20000) {
+      guard++;
+      if (ruleMatchesDateNoCount(rrule, start, cursor)) {
+        n++;
+        if (dateOnly(cursor).getTime() === target.getTime()) {
+          return n <= count;
+        }
+        if (n > count) return false;
+      }
+      cursor = new Date(cursor.getTime() + 86400000);
+    }
+    return n <= count;
+  }
+
+  return true;
+}
+
+function eventsOnDate(events, todayDate) {
+  const result = [];
+  for (const ev of events) {
+    if (!ev.dtstart) continue;
+    if (ev.exdates.includes(dateOnly(todayDate).getTime())) continue;
+
+    let occurs = false;
+    if (ev.rrule) {
+      occurs = ruleMatchesDate(ev.rrule, ev.dtstart.date, todayDate);
+    } else if (ev.dtstart.allDay) {
+      const endDate = ev.dtend ? ev.dtend.date : new Date(ev.dtstart.date.getTime() + 86400000);
+      occurs = todayDate >= dateOnly(ev.dtstart.date) && todayDate < dateOnly(endDate);
+    } else {
+      occurs = dateOnly(ev.dtstart.date).getTime() === dateOnly(todayDate).getTime();
+    }
+    if (!occurs) continue;
+
+    result.push({
+      title: ev.summary || '(sem título)',
+      allDay: !!ev.dtstart.allDay,
+      start: ev.dtstart.allDay ? null : `${String(ev.dtstart.raw.getUTCHours()).padStart(2, '0')}:${String(ev.dtstart.raw.getUTCMinutes()).padStart(2, '0')}`,
+      end: ev.dtend && !ev.dtend.allDay ? `${String(ev.dtend.raw.getUTCHours()).padStart(2, '0')}:${String(ev.dtend.raw.getUTCMinutes()).padStart(2, '0')}` : null,
+    });
+  }
+  result.sort((a, b) => {
+    if (a.allDay && !b.allDay) return -1;
+    if (!a.allDay && b.allDay) return 1;
+    return (a.start || '').localeCompare(b.start || '');
+  });
+  return result;
+}
+
+async function handleCalendarToday(env) {
+  const cfgRaw = await env.ROTINA_KV.get('config');
+  const cfg = cfgRaw ? JSON.parse(cfgRaw) : {};
+  if (!cfg.calendarIcalUrl) return json({ events: [], configured: false });
+
+  const resp = await fetch(cfg.calendarIcalUrl);
+  if (!resp.ok) return json({ events: [], configured: true, error: 'fetch_failed' }, 502);
+  const text = await resp.text();
+  const events = parseIcs(text);
+  const today = brazilToday();
+  return json({ events: eventsOnDate(events, today), configured: true });
+}
+
 async function handleFetch(request, env) {
   const url = new URL(request.url);
 
@@ -140,6 +359,10 @@ async function handleFetch(request, env) {
     doneMap[body.key] = !!body.done;
     await env.ROTINA_KV.put('done:' + body.date, JSON.stringify(doneMap));
     return json({ ok: true });
+  }
+
+  if (request.method === 'GET' && url.pathname === '/calendar/today') {
+    return handleCalendarToday(env);
   }
 
   return json({ error: 'not found' }, 404);
