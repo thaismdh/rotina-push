@@ -5,9 +5,6 @@ compatibility_date = "2024-09-23"
 [triggers]
 crons = ["* * * * *"]
 
-# After the first deploy, add the KV binding from the dashboard:
-# Worker -> Settings -> Bindings -> Add -> KV Namespace -> variable name ROTINA_KV
-# (or uncomment below and fill in the namespace id shown after you create it)
-# [[kv_namespaces]]
-# binding = "ROTINA_KV"
-# id = "PASTE_YOUR_KV_NAMESPACE_ID_HERE"
+[[kv_namespaces]]
+binding = "ROTINA_KV"
+id = "96086adb15cd4342b4f5fc4e1513fc66"
