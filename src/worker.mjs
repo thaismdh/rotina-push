@@ -347,7 +347,18 @@ async function handleFetch(request, env) {
   if (request.method === 'POST' && url.pathname === '/config') {
     const body = await request.json();
     if (!body || !body.config) return json({ error: 'missing config' }, 400);
-    await env.ROTINA_KV.put('config', JSON.stringify(body.config));
+    const existingCfgRaw = await env.ROTINA_KV.get('config');
+    const existingCfg = existingCfgRaw ? JSON.parse(existingCfgRaw) : {};
+    const merged = { ...existingCfg, ...body.config };
+    // Mesma proteção do /state: um aparelho com o campo vazio localmente não
+    // pode apagar um link já configurado só porque a cópia dele está desatualizada.
+    if (!body.config.calendarIcalUrl && existingCfg.calendarIcalUrl) {
+      merged.calendarIcalUrl = existingCfg.calendarIcalUrl;
+    }
+    if (!body.config.pushServerUrl && existingCfg.pushServerUrl) {
+      merged.pushServerUrl = existingCfg.pushServerUrl;
+    }
+    await env.ROTINA_KV.put('config', JSON.stringify(merged));
     return json({ ok: true });
   }
 
