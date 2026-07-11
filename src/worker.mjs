@@ -388,7 +388,19 @@ async function handleFetch(request, env) {
     // Mantém as chaves usadas pelo agendador de push em sincronia, sem mudar
     // o comportamento dele.
     if (body.state.config) {
-      await env.ROTINA_KV.put('config', JSON.stringify(body.state.config));
+      const existingCfgRaw = await env.ROTINA_KV.get('config');
+      const existingCfg = existingCfgRaw ? JSON.parse(existingCfgRaw) : {};
+      const merged = { ...existingCfg, ...body.state.config };
+      // Um aparelho com dado desatualizado (ex.: uma aba antiga que nunca
+      // recebeu o link mais recente) não pode apagar uma URL já configurada
+      // só porque a cópia dele está vazia nesses dois campos sensíveis.
+      if (!body.state.config.calendarIcalUrl && existingCfg.calendarIcalUrl) {
+        merged.calendarIcalUrl = existingCfg.calendarIcalUrl;
+      }
+      if (!body.state.config.pushServerUrl && existingCfg.pushServerUrl) {
+        merged.pushServerUrl = existingCfg.pushServerUrl;
+      }
+      await env.ROTINA_KV.put('config', JSON.stringify(merged));
     }
     if (body.state.history) {
       const { dateKey } = brazilNow();
