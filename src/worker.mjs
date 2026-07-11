@@ -365,6 +365,38 @@ async function handleFetch(request, env) {
     return handleCalendarToday(env);
   }
 
+  if (request.method === 'GET' && url.pathname === '/state') {
+    const raw = await env.ROTINA_KV.get('app_state');
+    if (!raw) return json({ state: null, updatedAt: 0 });
+    const parsed = JSON.parse(raw);
+    return json({ state: parsed.state, updatedAt: parsed.updatedAt });
+  }
+
+  if (request.method === 'POST' && url.pathname === '/state') {
+    const body = await request.json();
+    if (!body || !body.state || typeof body.updatedAt !== 'number') {
+      return json({ error: 'missing fields' }, 400);
+    }
+    const existingRaw = await env.ROTINA_KV.get('app_state');
+    const existing = existingRaw ? JSON.parse(existingRaw) : null;
+    if (existing && existing.updatedAt > body.updatedAt) {
+      // Outro aparelho já salvou algo mais recente; devolve essa versão em vez
+      // de sobrescrever, e deixa o cliente decidir adotar o que veio do servidor.
+      return json({ ok: true, applied: false, state: existing.state, updatedAt: existing.updatedAt });
+    }
+    await env.ROTINA_KV.put('app_state', JSON.stringify({ state: body.state, updatedAt: body.updatedAt }));
+    // Mantém as chaves usadas pelo agendador de push em sincronia, sem mudar
+    // o comportamento dele.
+    if (body.state.config) {
+      await env.ROTINA_KV.put('config', JSON.stringify(body.state.config));
+    }
+    if (body.state.history) {
+      const { dateKey } = brazilNow();
+      await env.ROTINA_KV.put('done:' + dateKey, JSON.stringify(body.state.history[dateKey] || {}));
+    }
+    return json({ ok: true, applied: true, state: body.state, updatedAt: body.updatedAt });
+  }
+
   return json({ error: 'not found' }, 404);
 }
 
