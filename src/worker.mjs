@@ -395,6 +395,20 @@ async function handleFetch(request, env) {
       // de sobrescrever, e deixa o cliente decidir adotar o que veio do servidor.
       return json({ ok: true, applied: false, state: existing.state, updatedAt: existing.updatedAt });
     }
+    // Protege calendarIcalUrl/pushServerUrl no PRÓPRIO blob principal (app_state),
+    // não só na cópia espelhada em 'config'. Um aparelho com esses dois campos
+    // vazios localmente (ex.: PWA recém-reinstalado, que ainda não terminou de
+    // puxar o estado real quando disparou esse push) não pode apagar um valor
+    // já configurado por outro aparelho.
+    const existingStateConfig = (existing && existing.state && existing.state.config) || {};
+    if (body.state.config) {
+      if (!body.state.config.calendarIcalUrl && existingStateConfig.calendarIcalUrl) {
+        body.state.config.calendarIcalUrl = existingStateConfig.calendarIcalUrl;
+      }
+      if (!body.state.config.pushServerUrl && existingStateConfig.pushServerUrl) {
+        body.state.config.pushServerUrl = existingStateConfig.pushServerUrl;
+      }
+    }
     await env.ROTINA_KV.put('app_state', JSON.stringify({ state: body.state, updatedAt: body.updatedAt }));
     // Mantém as chaves usadas pelo agendador de push em sincronia, sem mudar
     // o comportamento dele.
