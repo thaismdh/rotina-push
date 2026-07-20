@@ -119,6 +119,8 @@ async function handleScheduled(env) {
 // Not a full RFC5545 implementation - covers the common cases found in
 // personal Google Calendar exports: single events, all-day events, and
 // DAILY/WEEKLY/MONTHLY/YEARLY recurrence with INTERVAL/BYDAY/UNTIL/COUNT.
+// Also handles the common "edit just this one occurrence" case (a VEVENT
+// with RECURRENCE-ID overriding a single instance of a recurring series).
 
 function unfoldIcs(text) {
   return text.replace(/\r\n/g, '\n').replace(/\n[ \t]/g, '');
@@ -196,10 +198,12 @@ function parseIcs(text) {
     if (!cur) continue;
     const prop = parsePropLine(line);
     if (!prop) continue;
-    if (prop.name === 'SUMMARY') cur.summary = prop.value.replace(/\\,/g, ',').replace(/\\n/gi, ' ');
+    if (prop.name === 'UID') cur.uid = prop.value;
+    else if (prop.name === 'SUMMARY') cur.summary = prop.value.replace(/\\,/g, ',').replace(/\\n/gi, ' ');
     else if (prop.name === 'DTSTART') cur.dtstart = parseIcsDate(prop.value, prop.params);
     else if (prop.name === 'DTEND') cur.dtend = parseIcsDate(prop.value, prop.params);
     else if (prop.name === 'RRULE') cur.rrule = parseRRuleString(prop.value);
+    else if (prop.name === 'RECURRENCE-ID') cur.recurrenceId = parseIcsDate(prop.value, prop.params);
     else if (prop.name === 'EXDATE') {
       for (const v of prop.value.split(',')) {
         const parsed = parseIcsDate(v, prop.params);
@@ -282,10 +286,36 @@ function ruleMatchesDate(rrule, dtstartDate, targetDate) {
 }
 
 function eventsOnDate(events, todayDate) {
+  // Eventos recorrentes com UMA ocorrência editada individualmente (ex.: só o
+  // compromisso de hoje mudou de título/duração no Google Calendar) aparecem
+  // no ICS como duas entradas com o mesmo UID: a série original (com RRULE,
+  // sem EXDATE pra esse dia — o Google só usa EXDATE quando a ocorrência é
+  // excluída, não quando é só editada) e uma segunda entrada "override" com
+  // RECURRENCE-ID apontando pra data da ocorrência original, carregando os
+  // dados novos (outro horário/título). Sem tratar isso, a série original
+  // "ressuscitava" nesse dia com os dados antigos, escondendo a edição feita
+  // no Google Calendar (foi exatamente o bug visto com o evento de estudo).
+  const maskedByUid = new Map(); // uid -> Set(timestamp do dia da ocorrência original substituída)
+  events.forEach((ev) => {
+    if (ev.uid && ev.recurrenceId) {
+      if (!maskedByUid.has(ev.uid)) maskedByUid.set(ev.uid, new Set());
+      maskedByUid.get(ev.uid).add(dateOnly(ev.recurrenceId.date).getTime());
+    }
+  });
+
   const result = [];
   for (const ev of events) {
     if (!ev.dtstart) continue;
     if (ev.exdates.includes(dateOnly(todayDate).getTime())) continue;
+
+    // Se esta é a ocorrência "mestre" (não é ela mesma o override) de uma série
+    // que teve o dia de hoje editado separadamente, pula — quem representa hoje
+    // é a entrada override (tratada como um evento normal, pelo seu próprio
+    // dtstart, mais abaixo no mesmo loop).
+    if (!ev.recurrenceId && ev.uid) {
+      const masked = maskedByUid.get(ev.uid);
+      if (masked && masked.has(dateOnly(todayDate).getTime())) continue;
+    }
 
     let occurs = false;
     if (ev.rrule) {
